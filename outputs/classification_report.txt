@@ -1,0 +1,46 @@
+Test Results:
+Accuracy: 0.9909
+Precision (weighted): 0.9910
+Recall (weighted): 0.9909
+F1-score (weighted): 0.9909
+
+Classification Report:
+                               precision    recall  f1-score   support
+
+         Cercospora leaf spot       0.98      0.96      0.97        56
+                       Insect       0.98      0.98      0.98        46
+                  anthracnose       1.00      1.00      1.00        47
+                      healthy       1.00      0.99      0.99        86
+                leaf crinckle       0.99      0.99      0.99       110
+               powdery mildew       1.00      1.00      1.00        53
+                yellow mosaic       0.99      0.99      0.99       181
+             Bacterial Blight       1.00      0.98      0.99        47
+                   Curl Virus       1.00      0.98      0.99        44
+                 Healthy Leaf       1.00      0.98      0.99        47
+      Herbicide Growth Damage       1.00      1.00      1.00        58
+          Leaf Hopper Jassids       0.98      0.98      0.98        55
+                 Leaf Redding       0.94      0.98      0.96        46
+             Leaf Variegation       1.00      1.00      1.00        48
+curl_stage1+curl_stage2+sooty       1.00      1.00      1.00        59
+            curl_stage1+sooty       1.00      1.00      1.00        52
+                  curl_stage2       0.98      1.00      0.99        53
+            curl_stage2+sooty       1.00      1.00      1.00        43
+            Bacterial Pustule       0.96      0.98      0.97        53
+            Frogeye Leaf Spot       0.98      1.00      0.99        45
+                       Healty       0.97      1.00      0.99        33
+                Mossaic Virus       1.00      1.00      1.00        53
+                         Rust       0.96      0.94      0.95        52
+              Southern blight       1.00      1.00      1.00        43
+        Sudden Death Syndrone       1.00      0.98      0.99        43
+             Target Leaf Spot       1.00      1.00      1.00        48
+                Yellow Mosaic       0.98      1.00      0.99        55
+             bacterial_blight       1.00      1.00      1.00        53
+                   brown_spot       1.00      1.00      1.00        50
+                  crestamento       1.00      1.00      1.00        51
+                     ferrugen       1.00      1.00      1.00        48
+               powdery_mildew       1.00      1.00      1.00        49
+                     septoria       0.98      1.00      0.99        64
+
+                     accuracy                           0.99      1871
+                    macro avg       0.99      0.99      0.99      1871
+                 weighted avg       0.99      0.99      0.99      1871
