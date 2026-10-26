@@ -1,361 +1,349 @@
 """
-Multi-Crop Disease Classification using Transfer Learning (ResNet-50)
-Crops: Black Gram, Cotton, Soybean
-Total Classes: 33
+Transfer learning on PlantVillage -> PlantDoc with ResNet-50.
+
+    python train.py --stage pretrain      # ImageNet -> PlantVillage (54k, 38 cls)
+    python train.py --stage finetune      # PlantVillage -> PlantDoc (2.6k, 27 cls)
+
+Two-phase fine-tuning: the classifier head trains alone for the first N epochs,
+then the backbone unfreezes at a much lower learning rate. Unfreezing everything
+at lr=0.001 (the previous setting) overwrites the pretrained filters within one
+epoch, which is why a transfer-learning model can end up worse than scratch.
+
+Data layout and stage settings live in config.py and data.py.
 """
 
+import argparse
+import csv
+import json
+import math
 import os
 import time
-import copy
-import json
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.optim.lr_scheduler import StepLR
-from torch.utils.data import DataLoader, random_split
-from torchvision import datasets, models, transforms
-from torchvision.models import ResNet50_Weights
-
-# ─────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────
-DATA_DIR    = r"D:\college\DATASET\Augmented_Dataset"
-SAVE_DIR    = r"D:\college\MININ_PROJECT_CODE\TRANSFER_LEARNING\outputs"
-NUM_EPOCHS  = 40
-BATCH_SIZE  = 64
-LR          = 0.001
-STEP_SIZE   = 10         # decay LR every N epochs
-GAMMA       = 0.1        # LR decay factor
-VAL_SPLIT   = 0.15       # 15 % validation
-TEST_SPLIT  = 0.10       # 10 % test
-SEED        = 42
-NUM_WORKERS = 0
-
-os.makedirs(SAVE_DIR, exist_ok=True)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
-torch.manual_seed(SEED)
-
-# ─────────────────────────────────────────────
-#  DATA TRANSFORMS
-# ─────────────────────────────────────────────
-train_transforms = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomVerticalFlip(),
-    transforms.RandomRotation(15),
-    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225]),
-])
-
-val_test_transforms = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225]),
-])
-
-# ─────────────────────────────────────────────
-#  FLAT MULTI-CROP DATASET
-#  We merge all crop sub-folders into one flat
-#  dataset where the class name = "Crop_Disease"
-# ─────────────────────────────────────────────
-class MultiCropDataset(torch.utils.data.Dataset):
-    """Merge multiple ImageFolder roots into one dataset with prefixed labels."""
-
-    def __init__(self, root_dir, transform=None):
-        self.samples = []          # list of (path, label_idx)
-        self.transform = transform
-        self.class_to_idx = {}
-        self.classes = []
-
-        crop_dirs = sorted([
-            d for d in os.listdir(root_dir)
-            if os.path.isdir(os.path.join(root_dir, d))
-        ])
-
-        for crop in crop_dirs:
-            crop_path = os.path.join(root_dir, crop)
-            disease_dirs = sorted([
-                d for d in os.listdir(crop_path)
-                if os.path.isdir(os.path.join(crop_path, d))
-            ])
-            for disease in disease_dirs:
-                label_name = f"{crop}__{disease}"   # e.g. Black_Gram_cleaned__anthracnose
-                if label_name not in self.class_to_idx:
-                    self.class_to_idx[label_name] = len(self.classes)
-                    self.classes.append(label_name)
-
-                label_idx = self.class_to_idx[label_name]
-                disease_path = os.path.join(crop_path, disease)
-
-                for fname in os.listdir(disease_path):
-                    if fname.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
-                        self.samples.append((os.path.join(disease_path, fname), label_idx))
-
-        print(f"Total images : {len(self.samples)}")
-        print(f"Total classes: {len(self.classes)}")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        path, label = self.samples[idx]
-        from PIL import Image
-        img = Image.open(path).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
-        return img, label
+# ── Stage must be selected BEFORE config is imported ─────────────────────────
+def _parse_args():
+    p = argparse.ArgumentParser(description="Train a transfer-learning stage.")
+    p.add_argument("--stage", default=None, choices=["pretrain", "finetune"])
+    p.add_argument("--arch", default=None, help="e.g. resnet50, resnet18, efficientnet_b0")
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--img-size", type=int, default=None)
+    p.add_argument("--data-dir", default=None, help="Root holding the datasets")
+    p.add_argument("--dataset", default=None, help="Override the stage dataset path")
+    p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument("--no-sampler", action="store_true")
+    p.add_argument("--no-init", action="store_true",
+                   help="Ignore init_from and start from ImageNet weights only")
+    return p.parse_args()
 
 
-# ─────────────────────────────────────────────
-#  LOAD & SPLIT DATA
-# ─────────────────────────────────────────────
-print("\n--- Loading Dataset ---")
-full_dataset = MultiCropDataset(DATA_DIR, transform=None)
+ARGS = _parse_args()
+if ARGS.stage:
+    os.environ["PLANT_STAGE"] = ARGS.stage
+if ARGS.data_dir:
+    os.environ["PLANT_DATA_DIR"] = ARGS.data_dir
 
-num_total = len(full_dataset)
-num_val   = int(num_total * VAL_SPLIT)
-num_test  = int(num_total * TEST_SPLIT)
-num_train = num_total - num_val - num_test
+import config                                                    # noqa: E402
 
-train_ds, val_ds, test_ds = random_split(
-    full_dataset,
-    [num_train, num_val, num_test],
-    generator=torch.Generator().manual_seed(SEED)
-)
+if ARGS.epochs:
+    config.NUM_EPOCHS = ARGS.epochs
+if ARGS.batch_size:
+    config.BATCH_SIZE = ARGS.batch_size
+if ARGS.img_size:
+    config.IMG_SIZE = ARGS.img_size
+if ARGS.dataset:
+    config.DATASET_ROOT = ARGS.dataset
+if ARGS.arch:
+    config.ARCHITECTURE = ARGS.arch
+if ARGS.num_workers is not None:
+    config.NUM_WORKERS = ARGS.num_workers
+if ARGS.no_sampler:
+    config.USE_WEIGHTED_SAMPLER = False
+if ARGS.no_init:
+    config.INIT_CHECKPOINT = None
+    config.PRETRAINED = True
 
-# Apply transforms via wrapper
-class TransformSubset(torch.utils.data.Dataset):
-    def __init__(self, subset, transform):
-        self.subset = subset
-        self.transform = transform
+import torch                                                     # noqa: E402
+import torch.nn as nn                                            # noqa: E402
+from torch.amp import GradScaler, autocast                        # noqa: E402
+from tqdm import tqdm                                             # noqa: E402
 
-    def __len__(self):
-        return len(self.subset)
-
-    def __getitem__(self, idx):
-        from PIL import Image
-        path, label = self.subset.dataset.samples[self.subset.indices[idx]]
-        img = Image.open(path).convert("RGB")
-        return self.transform(img), label
+import data                                                       # noqa: E402
+from model import (build_model, set_backbone_trainable,           # noqa: E402
+                   set_backbone_bn_eval, head_parameters,
+                   backbone_parameters)
 
 
-train_ds_t = TransformSubset(train_ds, train_transforms)
-val_ds_t   = TransformSubset(val_ds,   val_test_transforms)
-test_ds_t  = TransformSubset(test_ds,  val_test_transforms)
+def accuracy(output, target):
+    _, preds = output.max(1)
+    return preds.eq(target).sum().item() / target.size(0)
 
-train_loader = DataLoader(train_ds_t, batch_size=BATCH_SIZE, shuffle=True,
-                          num_workers=NUM_WORKERS, pin_memory=True)
-val_loader   = DataLoader(val_ds_t,   batch_size=BATCH_SIZE, shuffle=False,
-                          num_workers=NUM_WORKERS, pin_memory=True)
-test_loader  = DataLoader(test_ds_t,  batch_size=BATCH_SIZE, shuffle=False,
-                          num_workers=NUM_WORKERS, pin_memory=True)
 
-num_classes = len(full_dataset.classes)
-print(f"\nTrain: {len(train_ds_t)} | Val: {len(val_ds_t)} | Test: {len(test_ds_t)}")
-print(f"Number of classes: {num_classes}")
+def banner(text, width=78):
+    print(f"\n{'=' * width}\n  {text}\n{'=' * width}")
 
-# Save class names
-with open(os.path.join(SAVE_DIR, "class_names.json"), "w") as f:
-    json.dump(full_dataset.classes, f, indent=2)
-print(f"Class names saved to {SAVE_DIR}\\class_names.json")
 
-# ─────────────────────────────────────────────
-#  MODEL — ResNet-50 with Fine-Tuning
-# ─────────────────────────────────────────────
-print("\n--- Building Model ---")
-model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+def make_scheduler(optimizer, total_epochs, warmup_epochs, kind,
+                   step_size, gamma):
+    """Linear warm-up followed by cosine or step decay, in one scheduler."""
+    def schedule(epoch):
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            return float(epoch + 1) / float(warmup_epochs)
+        if kind == "cosine":
+            span = max(1, total_epochs - warmup_epochs)
+            progress = min(1.0, (epoch - warmup_epochs) / span)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return float(gamma ** ((epoch - warmup_epochs) // max(1, step_size)))
 
-# Freeze all layers first
-for param in model.parameters():
-    param.requires_grad = False
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
 
-# Unfreeze layer3, layer4, and fc for fine-tuning
-for param in model.layer3.parameters():
-    param.requires_grad = True
-for param in model.layer4.parameters():
-    param.requires_grad = True
 
-# Replace final FC layer
-in_features = model.fc.in_features
-model.fc = nn.Sequential(
-    nn.Dropout(0.5),
-    nn.Linear(in_features, 512),
-    nn.ReLU(),
-    nn.Dropout(0.3),
-    nn.Linear(512, num_classes)
-)
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
+                    freeze_backbone=False, use_amp=True):
+    model.train()
+    if freeze_backbone:
+        set_backbone_bn_eval(model)
 
-model = model.to(device)
+    running_loss = running_acc = 0.0
+    total = 0
 
-# Count trainable parameters
-trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total     = sum(p.numel() for p in model.parameters())
-print(f"Trainable params: {trainable:,} / {total:,}")
+    pbar = tqdm(loader, desc="  Train", leave=False)
+    for images, labels in pbar:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
-# ─────────────────────────────────────────────
-#  LOSS, OPTIMIZER, SCHEDULER
-# ─────────────────────────────────────────────
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(
-    filter(lambda p: p.requires_grad, model.parameters()),
-    lr=LR, weight_decay=1e-4
-)
-scheduler = StepLR(optimizer, step_size=STEP_SIZE, gamma=GAMMA)
+        optimizer.zero_grad(set_to_none=True)
 
-# ─────────────────────────────────────────────
-#  TRAINING LOOP
-# ─────────────────────────────────────────────
-def train_model(model, criterion, optimizer, scheduler, num_epochs):
+        with autocast(device_type=device.type, enabled=use_amp):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        bs = labels.size(0)
+        running_loss += loss.item() * bs
+        running_acc += accuracy(outputs, labels) * bs
+        total += bs
+        pbar.set_postfix(loss=f"{running_loss/total:.4f}",
+                         acc=f"{running_acc/total:.4f}")
+
+    return running_loss / total, running_acc / total
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device, use_amp=True):
+    model.eval()
+    running_loss = running_acc = 0.0
+    total = 0
+
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        with autocast(device_type=device.type, enabled=use_amp):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+        bs = labels.size(0)
+        running_loss += loss.item() * bs
+        running_acc += accuracy(outputs, labels) * bs
+        total += bs
+
+    return running_loss / total, running_acc / total
+
+
+def train():
+    torch.manual_seed(config.SEED)
+    if config.NUM_WORKERS == 0:
+        pass
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = config.AMP and device.type == "cuda"
+
+    print(f"Stage : {config.ACTIVE_STAGE}")
+    print(f"Device: {device}" + (f"  ({torch.cuda.get_device_name(0)})"
+                                 if device.type == "cuda" else ""))
+
+    banner("Configuration")
+    print(f"  Data dir     : {config.DATA_DIR}")
+    print(f"  Dataset      : {config.DATASET_ROOT}")
+    print(f"  Architecture : {config.ARCHITECTURE}"
+          + ("  (ImageNet weights)" if config.PRETRAINED else ""))
+    if config.INIT_CHECKPOINT:
+        print(f"  Warm start   : {config.INIT_CHECKPOINT}")
+    print(f"  Image size   : {config.IMG_SIZE}")
+    print(f"  Batch size   : {config.BATCH_SIZE}")
+    print(f"  Epochs       : {config.NUM_EPOCHS}")
+    print(f"  Head LR      : {config.HEAD_LR}")
+    print(f"  Backbone LR  : {config.BACKBONE_LR}")
+    print(f"  Freeze epochs: {config.FREEZE_BACKBONE_EPOCHS}")
+    print(f"  AMP          : {use_amp}")
+
+    if not os.path.isdir(config.DATASET_ROOT):
+        raise SystemExit(
+            f"\nDataset not found: {config.DATASET_ROOT}\n"
+            f"Set the root with --data-dir or PLANT_DATA_DIR, or clone:\n"
+            f"  git clone https://github.com/spMohanty/PlantVillage-Dataset\n"
+            f"  git clone https://github.com/pratikkayal/PlantDoc-Dataset\n"
+            f"into {config.DATA_DIR}")
+
+    # ── Data ──
+    train_loader, val_loader, meta = data.get_dataloaders()
+    num_classes = meta["num_classes"]
+    idx_to_class = meta["idx_to_class"]
+
+    with open(os.path.join(config.SAVE_DIR, "class_names.json"), "w") as f:
+        json.dump({str(k): v for k, v in idx_to_class.items()}, f, indent=2)
+
+    # ── Model ──
+    model = build_model(
+        num_classes=num_classes,
+        architecture=config.ARCHITECTURE,
+        pretrained=config.PRETRAINED,
+        init_weights=not bool(config.INIT_CHECKPOINT),
+        dropout=config.DROPOUT,
+        init_from=config.INIT_CHECKPOINT,
+    ).to(device)
+
+    frozen = config.FREEZE_BACKBONE_EPOCHS > 0
+    if frozen:
+        set_backbone_trainable(model, False)
+        print(f"Backbone frozen for {config.FREEZE_BACKBONE_EPOCHS} epoch(s).")
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=config.LABEL_SMOOTHING)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": backbone_parameters(model), "lr": config.BACKBONE_LR},
+            {"params": head_parameters(model), "lr": config.HEAD_LR},
+        ],
+        lr=config.HEAD_LR, weight_decay=config.WEIGHT_DECAY,
+    )
+    scheduler = make_scheduler(optimizer, config.NUM_EPOCHS,
+                               config.WARMUP_EPOCHS, config.SCHEDULER,
+                               config.STEP_LR_SIZE, config.STEP_LR_GAMMA)
+    scaler = GradScaler(device=device.type, enabled=use_amp)
+
+    # ── Logging ──
+    log_path = os.path.join(config.SAVE_DIR, "training_log.csv")
+    log_file = open(log_path, "w", newline="")
+    log_writer = csv.writer(log_file)
+    log_writer.writerow(["epoch", "train_loss", "train_acc",
+                         "val_loss", "val_acc", "lr"])
+
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
-    best_model_wts = copy.deepcopy(model.state_dict())
-    best_acc = 0.0
+    best_val_loss, best_val_acc, best_epoch, patience = float("inf"), 0.0, 0, 0
+    ckpt_path = os.path.join(config.SAVE_DIR, "best_model.pth")
 
-    for epoch in range(num_epochs):
-        print(f"\nEpoch {epoch+1}/{num_epochs}  LR={scheduler.get_last_lr()}")
-        print("-" * 50)
-        t0 = time.time()
+    banner(f"Training {config.ACTIVE_STAGE}  |  {config.ARCHITECTURE}  |  "
+           f"{num_classes} classes  |  {config.NUM_EPOCHS} epochs")
+    start = time.time()
 
-        for phase in ["train", "val"]:
-            if phase == "train":
-                model.train()
-                loader = train_loader
-            else:
-                model.eval()
-                loader = val_loader
+    for epoch in range(1, config.NUM_EPOCHS + 1):
+        lr = optimizer.param_groups[1]["lr"]
 
-            running_loss = 0.0
-            running_corrects = 0
+        if frozen and epoch > config.FREEZE_BACKBONE_EPOCHS:
+            frozen = False
+            set_backbone_trainable(model, True)
+            print(f"  >> Unfroze backbone at epoch {epoch} "
+                  f"(backbone LR {optimizer.param_groups[0]['lr']:.2e})")
 
-            for batch_idx, (inputs, labels) in enumerate(loader):
-                inputs = inputs.to(device)
-                labels = labels.to(device)
+        print(f"Epoch {epoch}/{config.NUM_EPOCHS}  (head lr={lr:.2e}"
+              f"{', frozen backbone' if frozen else ''})")
 
-                optimizer.zero_grad()
-
-                with torch.set_grad_enabled(phase == "train"):
-                    outputs = model(inputs)
-                    _, preds = torch.max(outputs, 1)
-                    loss = criterion(outputs, labels)
-
-                    if phase == "train":
-                        loss.backward()
-                        optimizer.step()
-
-                running_loss     += loss.item() * inputs.size(0)
-                running_corrects += torch.sum(preds == labels.data)
-
-                if batch_idx % 50 == 0:
-                    print(f"  [{phase}] batch {batch_idx}/{len(loader)}  loss={loss.item():.4f}")
-
-            epoch_loss = running_loss     / (len(train_ds_t) if phase == "train" else len(val_ds_t))
-            epoch_acc  = running_corrects.double() / (len(train_ds_t) if phase == "train" else len(val_ds_t))
-
-            print(f"  {phase.upper()} Loss: {epoch_loss:.4f}  Acc: {epoch_acc:.4f}")
-
-            history[f"{phase}_loss"].append(epoch_loss)
-            history[f"{phase}_acc"].append(epoch_acc.item())
-
-            if phase == "val" and epoch_acc > best_acc:
-                best_acc = epoch_acc
-                best_model_wts = copy.deepcopy(model.state_dict())
-                torch.save(model.state_dict(), os.path.join(SAVE_DIR, "best_model.pth"))
-                print(f"  *** Best model saved (acc={best_acc:.4f}) ***")
-
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, scaler, device,
+            freeze_backbone=frozen, use_amp=use_amp)
+        val_loss, val_acc = evaluate(model, val_loader, criterion, device,
+                                     use_amp=use_amp)
         scheduler.step()
-        print(f"  Epoch time: {time.time()-t0:.1f}s")
 
-    print(f"\nBest Val Accuracy: {best_acc:.4f}")
-    model.load_state_dict(best_model_wts)
-    return model, history
+        log_writer.writerow([epoch, f"{train_loss:.5f}", f"{train_acc:.5f}",
+                             f"{val_loss:.5f}", f"{val_acc:.5f}", f"{lr:.6f}"])
+        log_file.flush()
+        for key, value in (("train_loss", train_loss), ("train_acc", train_acc),
+                           ("val_loss", val_loss), ("val_acc", val_acc)):
+            history[key].append(value)
+
+        print(f"  Train Loss: {train_loss:.4f}  |  Train Acc: {train_acc*100:.2f}%")
+        print(f"  Val   Loss: {val_loss:.4f}  |  Val   Acc: {val_acc*100:.2f}%")
+
+        if val_loss < best_val_loss:
+            best_val_loss, best_val_acc, best_epoch = val_loss, val_acc, epoch
+            patience = 0
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": epoch,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "num_classes": num_classes,
+                "idx_to_class": idx_to_class,
+                "architecture": config.ARCHITECTURE,
+                "stage": config.ACTIVE_STAGE,
+                "img_size": config.IMG_SIZE,
+                "layout": meta["layout"],
+                "uses_official_split": meta["uses_official_split"],
+            }, ckpt_path)
+            print(f"  [best] saved (val_loss={val_loss:.4f})")
+        else:
+            patience += 1
+            print(f"  No improvement ({patience}/{config.EARLY_STOP_PATIENCE})")
+
+        if patience >= config.EARLY_STOP_PATIENCE:
+            print(f"\n  Early stopping at epoch {epoch}.")
+            break
+        print()
+
+    log_file.close()
+    elapsed = time.time() - start
+
+    print("\nLoading best checkpoint for final evaluation...")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    val_loss, val_acc = evaluate(model, val_loader, criterion, device,
+                                 use_amp=use_amp)
+
+    summary = {
+        "stage": config.ACTIVE_STAGE,
+        "architecture": config.ARCHITECTURE,
+        "pretrained": config.PRETRAINED,
+        "warm_start": config.INIT_CHECKPOINT,
+        "dataset": config.DATASET_ROOT,
+        "layout": meta["layout"],
+        "uses_official_split": meta["uses_official_split"],
+        "metric_split": "validation",
+        "num_classes": num_classes,
+        "num_train": meta["num_train"],
+        "num_val": meta["num_val"],
+        "epochs_run": epoch,
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss,
+        "best_val_acc": best_val_acc,
+        "final_val_loss": val_loss,
+        "final_val_acc": val_acc,
+        "elapsed_min": elapsed / 60.0,
+        "img_size": config.IMG_SIZE,
+        "batch_size": config.BATCH_SIZE,
+        "head_lr": config.HEAD_LR,
+        "backbone_lr": config.BACKBONE_LR,
+        "freeze_backbone_epochs": config.FREEZE_BACKBONE_EPOCHS,
+        "scheduler": config.SCHEDULER,
+        "amp": use_amp,
+    }
+    with open(os.path.join(config.SAVE_DIR, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    with open(os.path.join(config.SAVE_DIR, "history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+
+    banner(f"Done in {elapsed/60:.1f} min  |  best epoch {best_epoch}  |  "
+           f"val acc {val_acc*100:.2f}%")
+    print(f"Checkpoint : {ckpt_path}")
+    print(f"Log        : {log_path}")
+    print(f"\nNext: python evaluate.py --stage {config.ACTIVE_STAGE}")
+
+    return model
 
 
-print("\n--- Starting Training ---")
-model, history = train_model(model, criterion, optimizer, scheduler, NUM_EPOCHS)
-
-# ─────────────────────────────────────────────
-#  TEST EVALUATION
-# ─────────────────────────────────────────────
-from sklearn.metrics import (accuracy_score, precision_score,
-                              recall_score, f1_score, classification_report)
-
-print("\n--- Test Evaluation ---")
-model.eval()
-all_preds  = []
-all_labels = []
-
-with torch.no_grad():
-    for inputs, labels in test_loader:
-        inputs = inputs.to(device)
-        labels = labels.to(device)
-        outputs = model(inputs)
-        _, preds = torch.max(outputs, 1)
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-
-# Short class names (strip crop prefix for readability)
-short_names = [c.split("__", 1)[1] for c in full_dataset.classes]
-
-test_acc       = accuracy_score(all_labels, all_preds)
-test_precision = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
-test_recall    = recall_score(all_labels, all_preds, average="weighted", zero_division=0)
-test_f1        = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
-
-report = classification_report(all_labels, all_preds, target_names=short_names, zero_division=0)
-
-summary = (
-    f"Test Results:\n"
-    f"Accuracy: {test_acc:.4f}\n"
-    f"Precision (weighted): {test_precision:.4f}\n"
-    f"Recall (weighted): {test_recall:.4f}\n"
-    f"F1-score (weighted): {test_f1:.4f}\n\n"
-    f"Classification Report:\n{report}"
-)
-
-print(summary)
-
-# Save to file
-report_path = os.path.join(SAVE_DIR, "classification_report.txt")
-with open(report_path, "w") as f:
-    f.write(summary)
-print(f"Classification report saved to {report_path}")
-
-# ─────────────────────────────────────────────
-#  SAVE TRAINING CURVES
-# ─────────────────────────────────────────────
-epochs_range = range(1, NUM_EPOCHS + 1)
-
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-axes[0].plot(epochs_range, history["train_loss"], label="Train Loss")
-axes[0].plot(epochs_range, history["val_loss"],   label="Val Loss")
-axes[0].set_title("Loss per Epoch")
-axes[0].set_xlabel("Epoch")
-axes[0].set_ylabel("Loss")
-axes[0].legend()
-
-axes[1].plot(epochs_range, history["train_acc"], label="Train Acc")
-axes[1].plot(epochs_range, history["val_acc"],   label="Val Acc")
-axes[1].set_title("Accuracy per Epoch")
-axes[1].set_xlabel("Epoch")
-axes[1].set_ylabel("Accuracy")
-axes[1].legend()
-
-plt.tight_layout()
-plt.savefig(os.path.join(SAVE_DIR, "training_curves.png"), dpi=150)
-print(f"Training curves saved to {SAVE_DIR}\\training_curves.png")
-
-# Save history
-with open(os.path.join(SAVE_DIR, "history.json"), "w") as f:
-    json.dump(history, f, indent=2)
-
-print("\nDone! Outputs saved to:", SAVE_DIR)
+if __name__ == "__main__":
+    train()
