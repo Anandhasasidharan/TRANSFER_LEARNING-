@@ -222,10 +222,6 @@ Mapped to the responsibilities of a data-science / analytics role.
 - Guarded failure: a missing dataset root produces an actionable message with the clone
   commands, instead of writing weights to a path that does not exist.
 
-> **Domain note.** This project is agricultural computer vision. The preprocessing,
-> modelling, reporting and diagnostic competencies above are domain-transferable; no
-> supply-chain or product-configuration domain experience is claimed here.
-
 ---
 
 ## Limitations
